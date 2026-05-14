@@ -28,10 +28,18 @@ export function isPidAlive(pid) {
 export function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new WatchCancelledError());
-    const timer = setTimeout(resolve, ms);
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener?.("abort", onAbort);
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const timer = setTimeout(() => settle(resolve), ms);
     const onAbort = () => {
       clearTimeout(timer);
-      reject(new WatchCancelledError());
+      settle(reject, new WatchCancelledError());
     };
     signal?.addEventListener?.("abort", onAbort, { once: true });
   });
@@ -77,7 +85,15 @@ export function runCommand(command, { cwd, signal } = {}) {
     const child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let settled = false;
     const cap = (s) => (s.length > 4000 ? `${s.slice(0, 2000)}\n…\n${s.slice(-2000)}` : s);
+    const cleanup = () => signal?.removeEventListener?.("abort", onAbort);
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
     child.stdout.on("data", (d) => {
       stdout = cap(stdout + d.toString());
     });
@@ -86,11 +102,11 @@ export function runCommand(command, { cwd, signal } = {}) {
     });
     const onAbort = () => {
       child.kill("SIGTERM");
-      reject(new WatchCancelledError());
+      settle(reject, new WatchCancelledError());
     };
     signal?.addEventListener?.("abort", onAbort, { once: true });
-    child.on("error", reject);
-    child.on("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
+    child.on("error", (err) => settle(reject, err));
+    child.on("close", (exitCode) => settle(resolve, { exitCode, stdout, stderr }));
   });
 }
 
@@ -156,6 +172,95 @@ export async function sleepUntil({ isoTime, timeoutMs, signal, onProgress } = {}
     },
     { pollMs: Math.min(1000, Math.max(25, effectiveTimeout || 25)), timeoutMs: effectiveTimeout + 5, signal, onProgress },
   );
+}
+
+function errorMessage(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function snapshotWatch(record) {
+  const { controller, notifyOnFinish, ...snapshot } = record;
+  return snapshot;
+}
+
+function statusForError(err) {
+  if (err instanceof WatchCancelledError) return "cancelled";
+  if (err instanceof WatchTimeoutError) return "timed_out";
+  return "failed";
+}
+
+export function createBackgroundWaitRegistry({ notify, idPrefix = "pi-watch" } = {}) {
+  const watchers = new Map();
+  let nextId = 1;
+
+  function finish(record, status, patch = {}) {
+    const wallElapsedMs = now() - record.startedAt;
+    record.status = status;
+    record.completedAt = record.startedAt + wallElapsedMs;
+    record.wallElapsedMs = wallElapsedMs;
+    for (const [key, value] of Object.entries(patch)) {
+      if (value !== undefined) record[key] = value;
+    }
+    record.elapsedMs = Number(patch.elapsedMs ?? (record.elapsedMs > 0 ? record.elapsedMs : wallElapsedMs));
+    const event = snapshotWatch(record);
+    watchers.delete(record.id);
+    if (record.notifyOnFinish === false) return;
+    try {
+      notify?.(event);
+    } catch {
+      // A background wake-up must never become an unhandled watcher failure.
+    }
+  }
+
+  return {
+    start({ kind, label, run } = {}) {
+      if (typeof run !== "function") throw new Error("background watch run function is required");
+      const id = `${idPrefix}-${nextId++}`;
+      const controller = new AbortController();
+      const record = {
+        id,
+        kind: kind || "wait",
+        label: label || kind || "wait",
+        status: "running",
+        startedAt: now(),
+        attempts: 0,
+        elapsedMs: 0,
+        lastMessage: undefined,
+        notifyOnFinish: true,
+        controller,
+      };
+      watchers.set(id, record);
+
+      const onProgress = (progress = {}) => {
+        record.attempts = Number(progress.attempts ?? record.attempts ?? 0);
+        record.elapsedMs = Number(progress.elapsedMs ?? now() - record.startedAt);
+        record.lastMessage = progress.message;
+      };
+
+      Promise.resolve()
+        .then(() => run(controller.signal, onProgress))
+        .then((result) => finish(record, "completed", {
+          result,
+          message: result?.message,
+          attempts: result?.attempts,
+          elapsedMs: result?.elapsedMs,
+        }))
+        .catch((err) => finish(record, statusForError(err), { error: errorMessage(err), message: errorMessage(err) }));
+
+      return snapshotWatch(record);
+    },
+
+    abortAll({ notify = true } = {}) {
+      for (const record of watchers.values()) {
+        record.notifyOnFinish = notify;
+        record.controller.abort();
+      }
+    },
+
+    list() {
+      return [...watchers.values()].map(snapshotWatch);
+    },
+  };
 }
 
 export function resultText(ok, title, details = {}) {
