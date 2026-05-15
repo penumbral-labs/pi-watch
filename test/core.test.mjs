@@ -79,7 +79,9 @@ test("background wait registry returns immediately and notifies on completion", 
   assert.equal(events[0].id, started.id);
   assert.equal(events[0].status, "completed");
   assert.equal(events[0].message, "ready");
-  assert.equal(registry.list().length, 0);
+  // Completed watches stay in history for list_watches
+  assert.equal(registry.list().length, 1);
+  assert.equal(registry.list({ includeCompleted: false }).length, 0);
 });
 
 test("background wait registry reports timeouts as wake events", async () => {
@@ -136,7 +138,8 @@ test("background wait registry can suppress notifications on abort", async () =>
   await new Promise((resolve) => setTimeout(resolve, 25));
 
   assert.equal(events.length, 0);
-  assert.equal(registry.list().length, 0);
+  // Completed watches stay in history; active list is empty
+  assert.equal(registry.list({ includeCompleted: false }).length, 0);
 });
 
 test("extension sleep_until defaults to background and wakes with custom message", async () => {

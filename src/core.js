@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { spawn } from "node:child_process";
 
 export class WatchTimeoutError extends Error {
@@ -144,9 +145,11 @@ export function fileConditionMet(filePath, condition = {}) {
   return { ok: true, stat: { size: stat.size, mtimeMs: stat.mtimeMs } };
 }
 
-export async function watchFile({ path: filePath, pollMs = 1000, timeoutMs, exists = true, minSize, modifiedAfterMs, contentIncludes, signal, onProgress } = {}) {
+export async function watchFile({ path: filePath, pollMs = 1000, timeoutMs, exists = true, minSize, modifiedAfterMs, contentIncludes, fromNow, signal, onProgress } = {}) {
   if (!filePath || typeof filePath !== "string") throw new Error("path is required");
-  const condition = { exists, minSize, modifiedAfterMs, contentIncludes };
+  // fromNow: only match content modified after watch start
+  const effectiveModifiedAfter = fromNow ? Math.max(Number(modifiedAfterMs ?? 0), now()) : modifiedAfterMs;
+  const condition = { exists, minSize, modifiedAfterMs: effectiveModifiedAfter, contentIncludes };
   return until(
     () => {
       const result = fileConditionMet(filePath, condition);
@@ -178,25 +181,113 @@ function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
 }
 
+// ── Background wait registry ────────────────────────────────────────
+
+const KIND_PREFIX = {
+  wait_for_pid: "pid",
+  wait_for_command: "cmd",
+  watch_file: "file",
+  sleep_until: "sleep",
+  wait: "watch",
+};
+
+function idPrefix(kind) {
+  return KIND_PREFIX[kind] || "watch";
+}
+
+function describeTarget(record) {
+  // Produce a short target identifier for notifications
+  try {
+    if (record.kind === "wait_for_pid") return `PID ${record.target}`;
+    if (record.kind === "watch_file" && record.target) return path.basename(record.target);
+  } catch { /* fall through */ }
+  return record.target || record.label || "-";
+}
+
+function describeCondition(record) {
+  const c = record.condition || {};
+  const parts = [];
+  if (c.contentIncludes !== undefined) parts.push(`contains "${String(c.contentIncludes).slice(0, 40)}"`);
+  if (c.minSize !== undefined) parts.push(`>= ${c.minSize} bytes`);
+  if (c.fromNow) parts.push("from now");
+  if (c.modifiedAfterMs && !c.fromNow) parts.push(`modified after ${new Date(c.modifiedAfterMs).toISOString()}`);
+  if (c.timeoutMs) parts.push(`timeout ${c.timeoutMs}ms`);
+  return parts.join(", ") || "-";
+}
+
+export function describeWatch(record) {
+  const group = record.group ? `[${record.group}] ` : "";
+  const label = record.label ? record.label : describeTarget(record);
+  const kind = record.kind || "wait";
+  const stale = record.superseded ? " (stale)" : "";
+  const cancelled = record.cancelledReason === "superseded" ? " (superseded)" :
+    record.cancelledReason === "manual" ? " (cancelled)" : "";
+  const suffix = stale || cancelled;
+  return `${group}${kind}${suffix}: ${label}`;
+}
+
+export function describeWatchResult(record) {
+  // Produces a compact one-line result string for notifications
+  const group = record.group ? `[${record.group}] ` : "";
+  const label = record.label || describeTarget(record);
+  const kind = record.kind || "wait";
+
+  if (record.superseded) {
+    return `${group}${kind} (stale/superseded by ${record.supersededBy || "newer watch"}): ${label} — ${record.status}`;
+  }
+  if (record.cancelledReason === "superseded") {
+    return `${group}${kind} (superseded by ${record.supersededBy || "newer watch"}): ${label} — ${record.status}`;
+  }
+  if (record.cancelledReason === "manual") {
+    return `${group}${kind} (manually cancelled): ${label} — ${record.status}`;
+  }
+
+  const target = describeTarget(record);
+  const elapsed = record.elapsedMs ? ` after ${record.elapsedMs}ms` : "";
+  const msg = record.message || record.lastMessage || "";
+  const cond = describeCondition(record);
+  const detail = msg ? ` ${msg}` : cond ? ` (${cond})` : "";
+
+  switch (record.status) {
+    case "completed": return `${group}${kind}: ${label} (${target}) completed${elapsed}${detail}`;
+    case "timed_out": return `${group}${kind}: ${label} (${target}) timed out${elapsed}`;
+    case "cancelled": return `${group}${kind}: ${label} (${target}) cancelled${elapsed}`;
+    case "failed": return `${group}${kind}: ${label} (${target}) failed: ${record.error || "unknown error"}`;
+    default: return `${group}${kind}: ${label} (${target}) ${record.status}`;
+  }
+}
+
 function snapshotWatch(record) {
-  const { controller, notifyOnFinish, ...snapshot } = record;
+  const { controller, notifyOnFinish, _finished, ...snapshot } = record;
   return snapshot;
 }
 
-function statusForError(err) {
+export function statusForError(err) {
   if (err instanceof WatchCancelledError) return "cancelled";
   if (err instanceof WatchTimeoutError) return "timed_out";
   return "failed";
 }
 
-export function createBackgroundWaitRegistry({ notify, idPrefix = "pi-watch" } = {}) {
+const MAX_COMPLETED_HISTORY = 200;
+
+export function createBackgroundWaitRegistry({ notify, onChange } = {}) {
   const watchers = new Map();
-  let nextId = 1;
+  const completed = [];
+  // Global monotonic counter — IDs are unique across all kinds
+  let nextGlobalId = 1;
+
+  function makeId(kind) {
+    return `${idPrefix(kind)}-${nextGlobalId++}`;
+  }
 
   function finish(record, status, patch = {}) {
+    // Guard against double-finish: supersedeGroup/cancelWatch/cancelGroup call finish()
+    // directly, and the .catch() handler may also fire when the abort triggers a rejection.
+    if (record._finished) return;
+    record._finished = true;
     const wallElapsedMs = now() - record.startedAt;
     record.status = status;
-    record.completedAt = record.startedAt + wallElapsedMs;
+    record.completedAt = now();
     record.wallElapsedMs = wallElapsedMs;
     for (const [key, value] of Object.entries(patch)) {
       if (value !== undefined) record[key] = value;
@@ -204,6 +295,10 @@ export function createBackgroundWaitRegistry({ notify, idPrefix = "pi-watch" } =
     record.elapsedMs = Number(patch.elapsedMs ?? (record.elapsedMs > 0 ? record.elapsedMs : wallElapsedMs));
     const event = snapshotWatch(record);
     watchers.delete(record.id);
+    // Keep completed watches in history for list_watches
+    completed.push(event);
+    if (completed.length > MAX_COMPLETED_HISTORY) completed.shift();
+    try { onChange?.(); } catch { /* best-effort */ }
     if (record.notifyOnFinish === false) return;
     try {
       notify?.(event);
@@ -213,23 +308,49 @@ export function createBackgroundWaitRegistry({ notify, idPrefix = "pi-watch" } =
   }
 
   return {
-    start({ kind, label, run } = {}) {
+    start({ kind, label, group, target, condition, notifyOnFinish, run, supersedeGroup } = {}) {
       if (typeof run !== "function") throw new Error("background watch run function is required");
-      const id = `${idPrefix}-${nextId++}`;
+      const id = makeId(kind);
+
+      // Supersede existing watches in the same group
+      const supersededIds = [];
+      if (supersedeGroup && group) {
+        for (const record of watchers.values()) {
+          if (record.group === group && record.status === "running") {
+            record.notifyOnFinish = false;
+            record.superseded = true;
+            record.supersededBy = id;
+            record.controller.abort();
+            supersededIds.push(record.id);
+            finish(record, "cancelled", { cancelledReason: "superseded", supersededBy: id });
+          }
+        }
+      }
+
       const controller = new AbortController();
       const record = {
         id,
         kind: kind || "wait",
         label: label || kind || "wait",
+        group: group || undefined,
+        target: target || label || kind || "wait",
+        condition: condition || undefined,
         status: "running",
         startedAt: now(),
         attempts: 0,
         elapsedMs: 0,
         lastMessage: undefined,
-        notifyOnFinish: true,
+        notifyOnFinish: notifyOnFinish !== false,
         controller,
+        superseded: false,
+        supersededBy: undefined,
+        cancelledReason: undefined,
+        supersededIds: supersededIds.length > 0 ? supersededIds : undefined,
       };
       watchers.set(id, record);
+
+      // Fire onChange after adding to map so list() sees the new watch
+      try { onChange?.(); } catch { /* best-effort */ }
 
       const onProgress = (progress = {}) => {
         record.attempts = Number(progress.attempts ?? record.attempts ?? 0);
@@ -250,6 +371,31 @@ export function createBackgroundWaitRegistry({ notify, idPrefix = "pi-watch" } =
       return snapshotWatch(record);
     },
 
+    cancelWatch(id) {
+      const record = watchers.get(id);
+      if (!record) return false;
+      record.notifyOnFinish = false;
+      record.controller.abort();
+      finish(record, "cancelled", { cancelledReason: "manual" });
+      // onChange already fired in finish()
+      return true;
+    },
+
+    cancelGroup(group) {
+      if (!group) return 0;
+      let count = 0;
+      for (const record of watchers.values()) {
+        if (record.group === group && record.status === "running") {
+          record.notifyOnFinish = false;
+          record.controller.abort();
+          finish(record, "cancelled", { cancelledReason: "manual" });
+          count++;
+        }
+      }
+      if (count > 0) { try { onChange?.(); } catch { /* best-effort */ } }
+      return count;
+    },
+
     abortAll({ notify = true } = {}) {
       for (const record of watchers.values()) {
         record.notifyOnFinish = notify;
@@ -257,8 +403,16 @@ export function createBackgroundWaitRegistry({ notify, idPrefix = "pi-watch" } =
       }
     },
 
-    list() {
-      return [...watchers.values()].map(snapshotWatch);
+    list({ includeCompleted = true } = {}) {
+      const active = [...watchers.values()].map(snapshotWatch);
+      if (!includeCompleted) return active;
+      // Return active first, then completed (most recent last in each group)
+      return [...active, ...completed.slice(-MAX_COMPLETED_HISTORY)];
+    },
+
+    get(id) {
+      const record = watchers.get(id);
+      return record ? snapshotWatch(record) : undefined;
     },
   };
 }
