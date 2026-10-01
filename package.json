@@ -18,14 +18,17 @@
     "test": "node --test test/*.test.mjs",
     "verify": "npm test"
   },
-  "dependencies": {
-    "typebox": "^1.1.34"
-  },
   "keywords": [
     "pi-package",
     "pi-extension",
     "watch",
     "wait",
     "temporal"
-  ]
+  ],
+  "peerDependencies": {
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "typebox": "^1.1.34"
+  }
 }
